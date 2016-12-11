@@ -1,0 +1,183 @@
+https://github.com/thinkaurelius/titan/issues/1045 ...
+
+ran BulkLoaderVertexProgram on Giraph, loading Grateful Dead from Gryo into Titan-Cassandra. BLVP needed minor changes to catch up with the new Kryo default registration list (Long[] -> long[]; no nulls to consider here).
+ran BulkLoaderVertexProgram on Spark, loading Grateful Dead from Gryo into Titan-Cassandra. Ran into an odd config handling difference between GiraphGraphComputer and SparkGraphComputer, but there's a workaround that requires no TP3 changes (though the fact that I needed a workaround compared with GiraphGC could indicate a bug in SparkGC).
+wrote a new Hadoop 1 OutputFormat (named "TitanH1OutputFormat" right now, subject to change) that can only write vertex properties.
+This gives us two ways to write to Titan from GraphComputers:
+
+For VertexPrograms that just want to write properties to existing vertices, such as PageRankVertexProgram, TitanH1OutputFormat can do that without any additional iterations or mapreduces.
+For bulk loading, we have BulkLoaderVertexProgram, which can be fed from an arbitrary TP3-supported input source. For instance, workload that needs to add edges and vertices could first write to Gryo, then a separate BLVP computation could read the Gryo files and write to Titan.
+This stuff is still pretty raw and experimental. Known problems:
+
+The old org.jboss.netty seems to conflict somehow with the new io.netty under Spark. I have to delete the org.jboss.netty to get Spark to run. I'll look into that, since I'm concerned that's just breaking something else.
+The config handling is ugly: BulkLoaderVertexProgram and TitanH1OutputFormat use different config key prefixes their respective Titan configs for no real reason, and TitanH1OutputFormat's keys are just prefixed with "input.conf.", which is bad in so many ways.
+I think setting GraphComputer.ResultGraph to ORIGINAL on BLVP by default is wrong. It should be NEW.
+Sometimes the future returned by GiraphGC running BLVP seems to block indefinitely, even after the bulk load has successfully completed. Opening StandardTitanGraph in another shell shows the data all there, but the future is stuck. I haven't seen this when doing the same BLVP on SparkGC yet.
+I need to call InputOutputHelper.registerInputOutputPair to avoid a cosmetic NPE in at least one case
+SparkGC and GiraphGC seem to process BulkLoaderVertexProgram's config differently; I have to use different steps to get the same results on each framework
+But this is just the proof-of-concept stage. Here's what I can do now (b4e62ef). Feedback in general and in particular from @dkuppitz would be welcome.
+
+Store Spark-computed PageRank on Titan vertices using the OutputFormat
+
+# Load GotG into Titan-Cassandra, run PageRank, save results using TitanH1OutputFormat
+# (Shell commands below)
+bin/titan.sh stop
+mvn clean install -DskipTests=true
+rm lib/netty-3.2.7.Final.jar
+bin/titan.sh start
+bin/gremlin.sh <<EOF
+t = TitanFactory.open('conf/titan-cassandra-es.properties')
+GraphOfTheGodsFactory.load(t)
+
+// Pre-create pagerank property keys to avoid lock contention in the outputformat
+m = t.openManagement()
+m.makePropertyKey('gremlin.pageRankVertexProgram.pageRank').dataType(Double.class).make()
+m.makePropertyKey('gremlin.pageRankVertexProgram.edgeCount').dataType(Double.class).make()
+m.commit()
+t.close()
+
+// Temporary hack -- avoids an annoying but harmless NPE in future.get() below
+InputOutputHelper.registerInputOutputPair(FileInputFormat.class, com.thinkaurelius.titan.hadoop.formats.TitanH1OutputFormat.class)
+
+// Run PageRank on Spark and write the element compute keys to the respective Titan vertices
+hadoopGraph = GraphFactory.open('hg.prop')
+future = hadoopGraph.compute(SparkGraphComputer.class).program(new PageRankVertexProgram()).submit()
+future.get()
+
+// Dump vertices in OLTP, showing the just-added PR props
+t = TitanFactory.open('conf/titan-cassandra-es.properties')
+t.traversal().V().valueMap()
+EOF
+Here is the hg.prop file referenced above:
+
+gremlin.graph=org.apache.tinkerpop.gremlin.hadoop.structure.HadoopGraph
+gremlin.hadoop.graphInputFormat=com.thinkaurelius.titan.hadoop.formats.cassandra.CassandraInputFormat
+gremlin.hadoop.graphOutputFormat=com.thinkaurelius.titan.hadoop.formats.TitanH1OutputFormat
+gremlin.hadoop.memoryOutputFormat=org.apache.hadoop.mapreduce.lib.output.SequenceFileOutputFormat
+gremlin.hadoop.deriveMemory=false
+gremlin.hadoop.jarsInDistributedCache=true
+gremlin.hadoop.inputLocation=none
+gremlin.hadoop.outputLocation=output
+input.conf.storage.backend=cassandrathrift
+input.conf.storage.hostname=localhost
+#####################################
+# GiraphGraphComputer Configuration #
+#####################################
+giraph.minWorkers=2
+giraph.maxWorkers=2
+giraph.useOutOfCoreGraph=true
+giraph.useOutOfCoreMessages=true
+mapred.map.child.java.opts=-Xmx1024m
+mapred.reduce.child.java.opts=-Xmx1024m
+giraph.numInputThreads=4
+giraph.numComputeThreads=4
+giraph.maxMessagesInMemory=100000
+####################################
+# SparkGraphComputer Configuration #
+####################################
+spark.master=local[4]
+spark.executor.memory=1g
+spark.serializer=org.apache.spark.serializer.KryoSerializer
+cassandra.input.partitioner.class=org.apache.cassandra.dht.Murmur3Partitioner
+The last traversal should print something like this, irrespective of line order:
+
+==>[gremlin.pageRankVertexProgram.pageRank:[0.23864803741939838], name:[cerberus], gremlin.pageRankVertexProgram.edgeCount:[1.0]]
+==>[gremlin.pageRankVertexProgram.pageRank:[0.2295501250550773], name:[sea], gremlin.pageRankVertexProgram.edgeCount:[0.0]]
+==>[gremlin.pageRankVertexProgram.pageRank:[0.21761710958434682], name:[sky], gremlin.pageRankVertexProgram.edgeCount:[0.0]]
+==>[gremlin.pageRankVertexProgram.pageRank:[0.17550000000000002], name:[nemean], gremlin.pageRankVertexProgram.edgeCount:[0.0]]
+==>[gremlin.pageRankVertexProgram.pageRank:[0.29716723463942407], name:[pluto], gremlin.pageRankVertexProgram.edgeCount:[4.0], age:[4000]]
+==>[gremlin.pageRankVertexProgram.pageRank:[0.17550000000000002], name:[hydra], gremlin.pageRankVertexProgram.edgeCount:[0.0]]
+==>[gremlin.pageRankVertexProgram.pageRank:[0.15000000000000002], name:[hercules], gremlin.pageRankVertexProgram.edgeCount:[5.0], age:[30]]
+==>[gremlin.pageRankVertexProgram.pageRank:[0.17550000000000002], name:[alcmene], gremlin.pageRankVertexProgram.edgeCount:[0.0], age:[45]]
+==>[gremlin.pageRankVertexProgram.pageRank:[0.31819816247447563], name:[jupiter], gremlin.pageRankVertexProgram.edgeCount:[4.0], age:[5000]]
+==>[gremlin.pageRankVertexProgram.pageRank:[0.2807651470037452], name:[neptune], gremlin.pageRankVertexProgram.edgeCount:[3.0], age:[4500]]
+==>[gremlin.pageRankVertexProgram.pageRank:[0.41599886933191116], name:[tartarus], gremlin.pageRankVertexProgram.edgeCount:[0.0]]
+==>[gremlin.pageRankVertexProgram.pageRank:[0.21761710958434682], name:[saturn], gremlin.pageRankVertexProgram.edgeCount:[0.0], age:[10000]]
+Load Grateful Dead into Titan-Cassandra on Spark using BulkLoaderVertexProgram
+
+# Load Grateful Dead into Titan-Cassandra with Spark
+# (Shell commands below)
+bin/titan.sh stop
+mvn clean install -DskipTests=true
+rm lib/netty-3.2.7.Final.jar
+bin/titan.sh start
+bin/gremlin.sh <<EOF
+// Spark
+graph = GraphFactory.open('blvp.prop')
+
+// Doesn't work on Spark; debugging shows the VP config is empty at runtime
+// future = graph.compute(SparkGraphComputer.class).program(new BulkLoaderVertexProgram()).result(GraphComputer.ResultGraph.NEW).persist(GraphComputer.Persist.EDGES).submit()
+
+apacheGraphConf = new org.apache.commons.configuration.BaseConfiguration()
+apacheGraphConf.setProperty('storage.backend', 'cassandrathrift')
+future = graph.compute(SparkGraphComputer.class).program(new BulkLoaderVertexProgram().useGraphConfig(apacheGraphConf)).result(GraphComputer.ResultGraph.NEW).persist(GraphComputer.Persist.EDGES).submit()
+
+future.get()
+
+t = TitanFactory.open('conf/titan-cassandra-es.properties')
+t.traversal().V().valueMap()
+t.close()
+EOF
+The valueMap() should print familiar Grateful Dead stuff, such as:
+
+==>[name:[Tampa_Red]]
+==>[name:[Lesh_Hart_Kreutzmann]]
+==>[name:[Garcia]]
+==>[name:[THE FROZEN LOGGER], songType:[cover], performances:[6]]
+==>[name:[TASTEBUD], songType:[original], performances:[1]]
+==>[name:[ROCKIN PNEUMONIA], songType:[], performances:[0]]
+==>[name:[Greenwich_Barry_Spector]]
+==>[name:[JAM], songType:[original], performances:[24]]
+[etc...]
+Here's blvp.prop referenced above:
+
+gremlin.graph=org.apache.tinkerpop.gremlin.hadoop.structure.HadoopGraph
+gremlin.hadoop.graphInputFormat=org.apache.tinkerpop.gremlin.hadoop.structure.io.gryo.GryoInputFormat
+gremlin.hadoop.graphOutputFormat=org.apache.tinkerpop.gremlin.hadoop.structure.io.gryo.GryoOutputFormat
+gremlin.hadoop.memoryOutputFormat=org.apache.hadoop.mapreduce.lib.output.SequenceFileOutputFormat
+gremlin.hadoop.deriveMemory=false
+gremlin.hadoop.jarsInDistributedCache=true
+gremlin.hadoop.inputLocation=data/grateful-dead-vertices.gio
+gremlin.hadoop.outputLocation=output
+input.conf.storage.backend=cassandrathrift
+input.conf.storage.hostname=localhost
+titan.bulkload.graphconfig.storage.backend=cassandrathrift
+titan.bulkload.graphconfig.storage.hostname=localhost
+#####################################
+# GiraphGraphComputer Configuration #
+#####################################
+giraph.minWorkers=1
+giraph.maxWorkers=1
+giraph.SplitMasterWorker=false
+giraph.useOutOfCoreGraph=true
+giraph.useOutOfCoreMessages=true
+mapred.map.child.java.opts=-Xmx1024m
+mapred.reduce.child.java.opts=-Xmx1024m
+giraph.numInputThreads=4
+giraph.numComputeThreads=4
+giraph.maxMessagesInMemory=100000
+####################################
+# SparkGraphComputer Configuration #
+####################################
+spark.master=local[4]
+spark.executor.memory=1g
+spark.serializer=org.apache.spark.serializer.KryoSerializer
+cassandra.input.partitioner.class=org.apache.cassandra.dht.Murmur3Partitioner
+Load Grateful Dead into Titan-Cassandra on Giraph using BulkLoaderVertexProgram
+
+# Load Grateful Dead into Titan-Cassandra with Giraph
+# (Shell commands below)
+bin/titan.sh stop
+mvn clean install -DskipTests=true
+rm lib/netty-3.2.7.Final.jar
+bin/titan.sh start
+bin/gremlin.sh <<EOF
+graph = GraphFactory.open('blvp.prop')
+future = graph.compute(GiraphGraphComputer.class).program(new BulkLoaderVertexProgram()).result(GraphComputer.ResultGraph.NEW).persist(GraphComputer.Persist.EDGES).submit()
+future.get()
+
+t = TitanFactory.open('conf/titan-cassandra-es.properties')
+t.traversal().V().valueMap()
+t.close()
+EOF
+The blvp.prop file is the same one used for Spark (above).
